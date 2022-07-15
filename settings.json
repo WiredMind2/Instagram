@@ -1,0 +1,8 @@
+{
+    "AUTH_SETTINGS_FILE": "./insta_data/login.json",
+    "DATABASE": "./insta_data/database.db",
+    "UNFOLLOW_DELAY": 604800,
+    "MAX_FILE_SIZE": 5000000,
+    "DISCORD_PING": "<@309008287888834571>",
+    "EMOJIS": "🙃😝🥴🤙👁🤷💅🎩🐥🪶✨🌈🍬🍪🧘🚀🛸🔫🧨🧬❤️💗🕎♐♊♨🗨💤➿"
+}
