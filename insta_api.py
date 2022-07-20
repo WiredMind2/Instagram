@@ -1,5 +1,4 @@
 import json
-# import multiprocessing.pool
 import os
 import queue
 import random
@@ -10,395 +9,29 @@ import threading
 import time
 import traceback
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
 
 import requests
 import urllib3
-from instagrapi import Client, config
-from instagrapi.exceptions import (
-	ClientError, ClientLoginRequired,
-	ClientNotFoundError, DirectThreadNotFound,
-	LoginRequired, PleaseWaitFewMinutes,
-	UnknownError, UserNotFound)
-from instagrapi.extractors import extract_media_v1, extract_user_short, extract_story_v1
-from instagrapi.types import Location, Media, BaseModel
-from instagrapi.utils import json_value
+from instagrapi import Client
+from instagrapi.exceptions import LoginRequired, PleaseWaitFewMinutes
+from instagrapi.types import Location
 
+import constants
 import secret
-from google_api import GoogleAPI, ImageEditor, VideoEditor
+from challenge import challenge_code_handler
+from utils import *
 
-# Classes
-
-
-class Follower():
-	FOLLOW = 1  # We followed the user
-	UNFOLLOW = 2  # We unfollowed the user
-	FOLLOWED = 3  # The user followed us
-	UNFOLLOWED = 4  # The user unfollowed us
-
-	KEEP = 5  # Don't unfollow
-	UNKEEP = 6  # Can unfollow
-
-	def __init__(self, *args, **data) -> None:
-		# Construct an instance from sql request data
-		if len(data) == 0:
-			self.data = {}
-			args = list(args)  # from tuple
-			for key in ('pk', 'username', 'follow_since', 'keep', 'is_following', 'is_followed', 'profile_pic_url'):
-				if args:
-					val = args.pop(0)
-				else:
-					val = None
-				self.data[key] = val
-		else:
-			self.data = data
-
-	def __getitem__(self, *args, **kwargs):
-		return self.data.__getitem__(*args, **kwargs)
-
-	def __getattr__(self, *args, **kwargs):
-		return self.data.__getitem__(*args, **kwargs)
-
-	def __setitem__(self, *args, **kwargs):
-		return self.data.__getitem__(*args, **kwargs)
-
-
-class AttrDict(dict):
-	def __init__(self, *args, **kwargs):
-		super(AttrDict, self).__init__(*args, **kwargs)
-		self.__dict__ = self
-
-
-# Iterators
-
-def user_followers_gql_chunk(self, user_id: str, max_amount: int = 0, end_cursor: str = None):
-	user_id = str(user_id)
-	users = []
-	variables = {
-		"id": user_id,
-		"include_reel": True,
-		"fetch_mutual": False,
-		"first": 12
-	}
-	self.inject_sessionid_to_public()
-	while True:
-		if end_cursor:
-			variables["after"] = end_cursor
-		data = self.public_graphql_request(
-			variables, query_hash="5aefa9893005572d237da5068082d8d5"
-		)
-		if not data["user"] and not users:
-			raise UserNotFound(user_id=user_id, **data)
-		page_info = json_value(
-			data, "user", "edge_followed_by", "page_info", default={})
-		edges = json_value(data, "user", "edge_followed_by",
-						   "edges", default=[])
-		for edge in edges:
-			user = extract_user_short(edge["node"])
-			users.append(user)
-			yield user
-		end_cursor = page_info.get("end_cursor")
-		if not page_info.get("has_next_page") or not end_cursor:
-			break
-		if max_amount and len(users) >= max_amount:
-			break
-
-
-def user_followers_v1_chunk(self, user_id: str, max_amount: int = 0, max_id: str = ""):
-	unique_set = set()
-	users = []
-	while True:
-		result = self.private_request(f"friendships/{user_id}/followers/", params={
-			"max_id": max_id,
-			"count": 10000,
-			"rank_token": self.rank_token,
-			"search_surface": "follow_list_page",
-			"query": "",
-			"enable_groups": "true"
-		})
-		for user in result["users"]:
-			user = extract_user_short(user)
-			if user.pk in unique_set:
-				continue
-			unique_set.add(user.pk)
-			users.append(user)
-			yield user
-
-		max_id = result.get("next_max_id")
-		if not max_id or (max_amount and len(users) >= max_amount):
-			break
-
-
-def user_followers(self, user_id, use_cache=True, amount=0):
-	user_id = str(user_id)
-	users = self._users_followers.get(user_id, {})
-	if not use_cache or not users or (amount and len(users) < amount):
-		try:
-			for user in user_followers_gql_chunk(self, user_id, amount):
-				yield user
-		except Exception as e:
-			if not isinstance(e, ClientError):
-				self.logger.exception(e)
-			for user in user_followers_v1_chunk(self, user_id, amount):
-				yield user
-		self._users_followers[user_id] = {user.pk: user for user in users}
-
-
-def user_medias_gql(self, user_id: int, sleep: int = 2):
-	user_id = int(user_id)
-	end_cursor = None
-	variables = {
-		"id": user_id,
-		"first": 50,  # These are Instagram restrictions, you can only specify <= 50
-	}
-	while True:
-		if end_cursor:
-			variables["after"] = end_cursor
-		medias_page, end_cursor = self.user_medias_paginated_gql(
-			user_id, sleep=sleep, end_cursor=end_cursor
-		)
-		for media in medias_page:
-			yield media
-		if not end_cursor:
-			break
-		time.sleep(sleep)
-
-
-def user_medias_v1(self, user_id: int):
-	user_id = int(user_id)
-	next_max_id = ""
-	while True:
-		try:
-			medias_page, next_max_id = self.user_medias_paginated_v1(
-				user_id,
-				end_cursor=next_max_id
-			)
-		except Exception as e:
-			self.logger.exception(e)
-			break
-		for media in medias_page:
-			yield media
-		if not self.last_json.get("more_available"):
-			break
-		next_max_id = self.last_json.get("next_max_id", "")
-
-
-def user_medias(self, user_id: int):
-	user_id = int(user_id)
+try:
+	from google_api import GoogleAPI, ImageEditor, VideoEditor
+except ImportError:
+	import sys
+	sys.path.append(os.path.abspath('../internet'))
 	try:
-		try:
-			for media in user_medias_gql(self, user_id):
-				yield media
-		except ClientLoginRequired as e:
-			if not self.inject_sessionid_to_public():
-				raise e
-			for media in user_medias_gql(self, user_id):
-				yield media
-	except Exception as e:
-		if not isinstance(e, ClientError):
-			self.logger.exception(e)
-		try:
-			for media in user_medias_v1(self, user_id):
-				yield media
-		except UnknownError as e:
-			print(
-				f'instagrapi.exceptions.UnknownError on user_medias({user_id}): {e}')
-
-# TODO - Fetch all highlights with a single API call
-
-
-def user_highlights(self, user_id: int, amount: int = 0):
-	amount = int(amount)
-	user_id = int(user_id)
-	params = {
-		"supported_capabilities_new": json.dumps(config.SUPPORTED_CAPABILITIES),
-		"phone_id": self.phone_id,
-		"battery_level": random.randint(25, 100),
-		"is_charging": random.randint(0, 1),
-		"will_sound_on": random.randint(0, 1),
-	}
-	result = self.private_request(f"feed/reels_tray/")
-	result = self.private_request(
-		f"highlights/{user_id}/highlights_tray/", params=params)
-	return [
-		self.extract_highlight_v1(highlight)
-		for highlight in result.get("tray", [])
-	]
-
-
-def get_timeline(self):
-	while True:
-		headers = {
-			"X-Ads-Opt-Out": "0",
-			"X-DEVICE-ID": self.uuid,
-			# str(random.randint(2000, 5000)),
-			"X-CM-Bandwidth-KBPS": '-1.000',
-			"X-CM-Latency": str(random.randint(1, 5)),
-		}
-		data = {
-			'_uuid': self.uuid,
-			'_csrftoken': self.token,
-			'is_prefetch': '0',
-			'is_pull_to_refresh': '0',
-			'phone_id': self.phone_id,
-			'timezone_offset': str(self.timezone_offset),
-		}
-		data = self.private_request(
-			"feed/timeline/", json.dumps(data), with_signature=False, headers=headers
-		)
-		for item in data.get('feed_items', []):
-			post = item.get('media_or_ad')
-			# TODO - Do something with 'suggested_users'
-			if post:
-				if post.get('product_type') == 'ad':
-					continue  # Ignore ads
-				yield extract_media_v1(post)
-
-		if data.get('more_available', False):
-			next_max_id = data.get('next_max_id')
-
-			data['max_id'] = next_max_id
-		else:
-			break
-
-
-def get_reels_tray(self):
-	REELS_COUNT = 3 # How many reels to fetch at once
-	to_fetch = []
-	data = {
-		"supported_capabilities_new": config.SUPPORTED_CAPABILITIES,
-		"timezone_offset": str(self.timezone_offset),
-		"tray_session_id": self.tray_session_id,
-		"request_id": self.request_id,
-		"latest_preloaded_reel_ids": "[]",  # [{"reel_id":"6009504750","media_count":"15","timestamp":1628253494,"media_ids":"[\"2634301737009283814\",\"2634301789371018685\",\"2634301853921370532\",\"2634301920174570551\",\"2634301973895112725\",\"2634302037581608844\",\"2634302088273817272\",\"2634302822117736694\",\"2634303181452199341\",\"2634303245482345741\",\"2634303317473473894\",\"2634303382971517344\",\"2634303441062726263\",\"2634303502039423893\",\"2634303754729475501\"]"},{"reel_id":"4357392188","media_count":"4","timestamp":1628250613,"media_ids":"[\"2634142331579781054\",\"2634142839803515356\",\"2634150786575125861\",\"2634279566740346641\"]"},{"reel_id":"5931631205","media_count":"7","timestamp":1628253023,"media_ids":"[\"2633699694927154768\",\"2634153361241413763\",\"2634196788830183839\",\"2634219197377323622\",\"2634294221109889541\",\"2634299705648894876\",\"2634299760434939842\"]"}],
-		"page_size": 50,
-		"_csrftoken": self.token,
-		"_uuid": self.uuid,
-	}
-	data = self.private_request("feed/reels_tray/", data)
-	for story in data['tray']:
-		user = extract_user_short(story['user'])
-		if user.username is None:
-			user = self.user_info(user.pk)
-
-		if not 'items' in story:
-			to_fetch.append(story['id'])
-
-			if len(to_fetch) == REELS_COUNT:
-				for reel in reel_info_v1(self, to_fetch):
-
-					if reel.user.pk != user.pk:
-						user = extract_user_short(story['user'])
-					if story['user']['username'] is None and user.username is None:
-						user = self.user_info(user.pk)
-
-					reel.user = user
-					yield reel
-				to_fetch = []
-
-			continue
-
-		for item in story['items']:
-			reel = extract_story_v1(item)
-			
-			if reel.user.pk != user.pk:
-				user = extract_user_short(story['user'])
-			if story['user']['username'] is None and user.username is None:
-				user = self.user_info(user.pk)
-
-			reel.user = user
-			yield reel
-
-
-	# for m_id in to_fetch:
-	# 	yield self.story_info(m_id)
-
-def reel_info_v1(self, pks):
-	args = '&'.join(f'reel_ids={pk}' for pk in pks)
-	result = self.private_request(f'feed/reels_media/?{args}',)
-	for pk, reel in result.get('reels', {}).items():
-		for media in reel.get('items', []):
-			yield extract_story_v1(media)
-
-
-def custom_direct_thread(self, thread_id: int, amount: int = 20, cursor=None):
-	# Iterate over all messages from thread
-	assert self.user_id, "Login required"
-	params = {
-		"visual_message_return_type": "unseen",
-		"direction": "older",
-		"seq_id": "40065",  # 59663
-		"limit": "20",
-	}
-	items = []
-	while True:
-		if cursor:
-			params["cursor"] = cursor
-		try:
-			result = self.private_request(
-				f"direct_v2/threads/{thread_id}/", params=params
-			)
-		except ClientNotFoundError as e:
-			raise DirectThreadNotFound(
-				e, thread_id=thread_id, **self.last_json)
-		thread = result["thread"]
-		for item in thread["items"]:
-			yield item
-			# items.append(item)
-		cursor = thread.get("oldest_cursor")
-		if not cursor or (amount and len(items) >= amount):
-			break
-
-
-def ddl_raven_media(media, filename=''):
-	imgs = media.get('image_versions2')
-	if not imgs:
-		return
-
-	empty = True
-	for candidate in imgs['candidates']:
-		url = candidate['url']
-		try:
-			req = requests.get(url)
-			req.raise_for_status()
-		except Exception as e:
-			print(e)
-			continue
-		else:
-			empty = False
-			break
-
-	if empty:
-		return
-
-	return save_media(url, req, filename)
-
-
-def ddl_thread_media(url, filename=''):
-	try:
-		req = requests.get(url)
-		req.raise_for_status()
-	except Exception as e:
-		print(e)
-		return
-
-	return save_media(url, req, filename)
-
-
-def save_media(url, req, filename=''):
-	fname = urlparse(url).path.rsplit("/", 1)[1].strip()
-	filename = "%s.%s" % (filename, fname.rsplit(".", 1)
-						  [1]) if filename else fname
-
-	with open(filename, "wb") as f:
-		for chunk in req.iter_content(chunk_size=8192):
-			f.write(chunk)
-
-	return filename
-
-# Utils
+		from google_api import GoogleAPI, ImageEditor, VideoEditor
+	except ImportError:
+		pass
 
 
 class InstaAPI(GoogleAPI):
@@ -415,21 +48,23 @@ class InstaAPI(GoogleAPI):
 		print(f'Logged in as {self.info.username}')
 
 	def get_db(self):
-		self.con = sqlite3.connect(SETTINGS['DATABASE'], check_same_thread=False)
+		self.con = sqlite3.connect(constants.SETTINGS['DATABASE'], check_same_thread=False)
 		self.con.row_factory = sqlite3.Row
 		self.cur = self.con.cursor()
 		self.db_lock = threading.RLock()
 
 	def login(self, use_cache=True):
 		self.cl = Client()
-		if use_cache and os.path.exists(SETTINGS['AUTH_SETTINGS_FILE']):
+		if use_cache and os.path.exists(constants.SETTINGS['AUTH_SETTINGS_FILE']):
 			try:
-				self.cl.load_settings(SETTINGS['AUTH_SETTINGS_FILE'])
+				self.cl.load_settings(constants.SETTINGS['AUTH_SETTINGS_FILE'])
 			except Exception as e:
 				print('Error while loading login settings:', e)
 
+		self.cl.challenge_code_handler = challenge_code_handler
+
 		self.cl.login(secret.USERNAME, secret.PASSWORD)
-		self.cl.dump_settings(SETTINGS['AUTH_SETTINGS_FILE'])
+		self.cl.dump_settings(constants.SETTINGS['AUTH_SETTINGS_FILE'])
 
 		default = AttrDict({
 			'pk': '39443737713',
@@ -585,7 +220,7 @@ class InstaAPI(GoogleAPI):
 			for user in users:
 				pk, username, follow_since, keep, is_following, is_followed, *_ = user
 				follow_time = int(time.time() - follow_since)
-				if follow_time > SETTINGS['UNFOLLOW_DELAY']:
+				if follow_time > constants.SETTINGS['UNFOLLOW_DELAY']:
 					print(f'Unfollowing {user["username"]}')
 					continue
 					try:
@@ -663,13 +298,6 @@ class InstaAPI(GoogleAPI):
 
 	# Media ddl
 
-	def create_dir(self, path):
-		if not os.path.exists(path):
-			root = os.path.dirname(path)
-			if not os.path.exists(root):
-				self.create_dir(root)
-			os.mkdir(path)
-
 	def media_downloaded(self, m):
 		# Check if a media has already been downloaded
 
@@ -699,41 +327,14 @@ class InstaAPI(GoogleAPI):
 
 		return exists
 
-	def get_media_folder(self, m):
-		if m.product_type == 'story':
-			folder = 'stories'
-		elif m.product_type == 'feed':
-			folder = 'feed'
-		elif m.product_type == 'igtv':
-			folder = 'IGTV'
-		elif m.product_type == 'clips':
-			folder = 'reels'
-		elif m.media_type == 1:
-			# Post
-			folder = 'posts'
-		elif m.media_type == 2:
-			# Video
-			folder = 'videos'
-		elif m.media_type == 8:
-			# Album
-			folder = 'posts'
-		else:
-			folder = 'others'
-
-		return folder
-
 	def get_media_filename(self, m):
-		user = m.user.username
-		if user is None:
-			pk = m.user.pk
-			user = self.cl.username_from_user_id(pk)
-			if user is None:
-				raise Exception(f'User with pk {pk} was not found!')
-				return None, None
-			m.user = user
+		username = m.user.username
+		if username is None:
+			username = self.get_username_from_pk(m.user.pk)
+			m.user.username = username
 
 		root = os.path.abspath(os.path.join(
-			'./insta_data', self.get_media_folder(m), user))
+			'./insta_data', get_media_folder(m), username))
 
 		timestamp = m.taken_at
 		if type(timestamp) is int:
@@ -752,7 +353,7 @@ class InstaAPI(GoogleAPI):
 			# Option 2: rename the images
 			filename += '-{}'
 
-		self.create_dir(root)
+		create_dir(root)
 		return root, filename
 
 	def ddl_media(self, m, force=False):
@@ -906,6 +507,25 @@ class InstaAPI(GoogleAPI):
 
 		print(f'- {count} highlights\n', end="")
 
+	def ddl_thread_medias(self, thread):
+		for msg in thread.messages:
+			if msg.item_type == 'raven_media':
+				ddl_raven_media(msg.visual_media['media'])
+			elif msg.item_type == 'media':
+				m = msg.media
+				if m.media_type == 1:
+					url = m.thumbnail_url
+				elif m.media_type == 2:
+					url = m.video_url
+				else:
+					print(f'Unknown media type: {m.media_type}')
+					continue
+				ddl_raven_media(url)
+
+	def ddl_thread_medias_pk(self, thread_id):
+		thread = insta.cl.direct_thread(thread_id)
+		return self.ddl_thread_medias(thread)
+
 	def que_handler(self, que, paths_queue):
 		count = 0
 		while True:
@@ -943,13 +563,20 @@ class InstaAPI(GoogleAPI):
 		handler.start()
 
 		# Stories
-		stories = get_reels_tray(self.cl)
+		stories = get_reels_tray(self.cl, tracked_id)
 
 		for story in stories:
 			if int(story.user.pk) in tracked_id and not self.media_downloaded(story):
-				que.put(story)			
+				if story.user.username is None:
+					username = self.get_username_from_pk(story.user.pk)
+					if not username:
+						continue
 
-		que.join()
+					story.user.username = username
+
+				que.put(story)
+
+			que.join()
 
 		# Posts 
 		posts = get_timeline(self.cl)
@@ -1010,6 +637,41 @@ class InstaAPI(GoogleAPI):
 		return paths
 
 	# Target finder
+
+	def get_username_from_pk(self, pk):
+		with self.db_lock:
+			self.cur.execute('SELECT username FROM users WHERE pk=?', (pk,))
+			data = self.cur.fetchone()
+			if data:
+				return data[0]
+			
+			user = self.cl.user_info(pk)
+			if user is None:
+				raise Exception(f'User with pk {pk} was not found!')
+			self.save_user(user)
+			return user.username
+
+	def save_user(self, user):
+		sql_exists = "SELECT EXISTS(SELECT 1 FROM users WHERE pk=?)"
+		sql_user = f"INSERT INTO users (pk, username, follow_since, keep, is_following, is_followed, followers, following, private, profile_pic_url) VALUES (:pk, :username, {int(time.time())}, {Follower.UNKEEP}, 0, 0, :followers, :following, :private, :profile_pic_url)"
+
+		with self.db_lock:
+			pk = int(user.pk)
+			self.cur.execute(sql_exists, (pk,))
+
+			user_exists = bool(self.cur.fetchone()[0])
+			if not user_exists: # TODO - Check if user data is complete
+				data = {
+					'pk': user.pk,
+					'username': user.username,
+					'followers': user.follower_count,
+					'following': user.following_count,
+					'private': int(user.is_private),
+					'profile_pic_url': user.profile_pic_url_hd or user.profile_pic_url
+				}
+				self.cur.execute(sql_user, data)
+
+				print(f'Saved new user: {data["username"]}, {data["followers"]}/{data["following"]}')
 
 	def parse_new_user_followers(self):
 		sql = "SELECT pk FROM users WHERE pk not in (SELECT user FROM follows);"
@@ -1167,7 +829,7 @@ class InstaAPI(GoogleAPI):
 		if desc_mode == 'none':
 			desc = ''
 		elif desc_mode == 'rnd_emoji':
-			desc = random.choice(list(SETTINGS['EMOJIS']))
+			desc = random.choice(list(constants.SETTINGS['EMOJIS']))
 		else:
 			desc = desc_mode
 
@@ -1206,7 +868,7 @@ class InstaAPI(GoogleAPI):
 
 				data = json.dumps(data)
 				r = requests.post(
-					BASE_URL + f'?unlock=will&sync_db={count}', data=data)
+					constants.BASE_URL + f'?unlock=will&sync_db={count}', data=data)
 				r.raise_for_status()
 
 				data = []
@@ -1218,7 +880,7 @@ class InstaAPI(GoogleAPI):
 		with open(path, 'rb') as f:
 			headers = {'content-type': 'application/x-www-form-urlencoded'}
 			r = requests.post(
-				BASE_URL + f'?unlock=will&upload_path={rel_path}', headers=headers, data=f)
+				constants.BASE_URL + f'?unlock=will&upload_path={rel_path}', headers=headers, data=f)
 			r.raise_for_status()
 			if r.content == b'Ok':
 				print(f'Sent {rel_path}\n', end="")
@@ -1228,7 +890,7 @@ class InstaAPI(GoogleAPI):
 
 	def get_server_medias(self):
 		try:
-			r = requests.get(BASE_URL + '?unlock=will&get_medias=ALL')
+			r = requests.get(constants.BASE_URL + '?unlock=will&get_medias=ALL')
 			r.raise_for_status()
 			medias = r.json()
 			return medias
@@ -1239,7 +901,7 @@ class InstaAPI(GoogleAPI):
 	def send_new_medias(self, paths):
 		known = set(self.get_server_medias())
 		for path in paths:
-			if os.path.exists(path) and os.path.getsize(path) < SETTINGS['MAX_FILE_SIZE'] and path not in known:
+			if os.path.exists(path) and os.path.getsize(path) < constants.SETTINGS['MAX_FILE_SIZE'] and path not in known:
 				try:
 					self.send_server(path)
 				except Exception as e:
@@ -1384,16 +1046,15 @@ class InstaAPI(GoogleAPI):
 				self.cur.execute('SELECT value FROM cache WHERE key="last_seen_comment"')
 				last_comment = self.cur.fetchone()[0]
 
-			new_comment = self.get_comments(last_comment)
+				new_comment = self.get_comments(last_comment)
 
-			with self.db_lock:
 				self.cur.execute('UPDATE cache SET value=? WHERE key="last_seen_comment"', (new_comment,))
 				self.con.commit()
 		except Exception as e:
 			self.send_error(e)
 
 		try:
-			self.add_new_medias(3)
+			self.add_new_medias(processes=3)
 		except Exception as e:
 			self.send_error(e)
 
@@ -1413,7 +1074,7 @@ class InstaAPI(GoogleAPI):
 		)
 		data = {'content': text}
 
-		if SEND_DC_ARCHIVES:
+		if constants.SEND_DC_ARCHIVES:
 			archives = self.create_archive(paths)
 			if len(archives) == 0:
 				files = None
@@ -1427,7 +1088,7 @@ class InstaAPI(GoogleAPI):
 		r = requests.post(secret.WEBHOOK_URL, data=data, files=files)
 		r.raise_for_status()
 
-		if SEND_DC_ARCHIVES:
+		if constants.SEND_DC_ARCHIVES:
 			if len(archives) > 1:
 				for archive in archives[1:]:
 					files = {
@@ -1449,8 +1110,8 @@ class InstaAPI(GoogleAPI):
 		err_text = traceback.format_exception(
 			type(e), value=e, tb=e.__traceback__)
 		text = (
-			'An error occured on insta_api.py!\n' if not SETTINGS[
-				'DISCORD_PING'] else f'{SETTINGS["DISCORD_PING"]}, an error occured on insta_api.py!\n'
+			'An error occured on insta_api.py!\n' if not constants.SETTINGS[
+				'DISCORD_PING'] else f'{constants.SETTINGS["DISCORD_PING"]}, an error occured on insta_api.py!\n'
 			f'Timestamp: {datetime.now().isoformat()}\n'
 		) + ''.join(err_text)
 
@@ -1537,20 +1198,9 @@ class InstaAPI(GoogleAPI):
 
 
 if __name__ == '__main__':
-	SEND_DC_ARCHIVES = False
-	LOCAL = False
-	BASE_URL = "http://localhost/instagram" if LOCAL else "https://www.tetrazero.com/instagram"
-
 	print(f'---{datetime.now().isoformat()}---')
 
-	SETTINGS_FILE = './settings.json'
-	if not os.path.exists(SETTINGS_FILE):
-		open(SETTINGS_FILE, 'x').close()
-		print('Please set new settings')
-		exit()
-
-	with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
-		SETTINGS = json.load(f)
+	constants.init()
 
 	if len(sys.argv) > 1:
 		insta = InstaAPI()
@@ -1589,35 +1239,45 @@ if __name__ == '__main__':
 
 		elif action == 'delete':
 			insta.delete_medias()
+		
+		elif action == 'get_thread':
+			if args:
+				insta.ddl_thread_medias_pk(args[0])
+			else:
+				threads = list(insta.list_threads())
+				for i, t in enumerate(threads):
+					print(f'{i+1} - {t.thread_title}')
+
+				thread = None
+				while thread is None:
+					try:
+						choice = int(input('Index: '))-1
+						if choice < 0 :
+							continue
+						thread = threads[choice]
+					except:
+						pass
+
+				insta.ddl_thread_medias(thread)
 
 		exit()
 
 	insta = InstaAPI(files_root=os.path.abspath('insta_data'))
-	# insta.get_tracked_medias()
+
 	insta.schedule()
 
-	# for e in get_reels_tray(insta.cl):
-	# 	pass
+	
+	try:
+		with insta.db_lock:
+			insta.cur.execute('SELECT value FROM cache WHERE key="last_seen_comment"')
+			last_comment = insta.cur.fetchone()[0]
 
-	# threads = insta.list_threads()
-	que = []
-	t_id = '340282366841710300949128175644303772676'
-	messages = insta.cl.direct_messages(t_id)
-	for msg in messages:
-		if msg.item_type == 'raven_media':
-			ddl_raven_media(msg.visual_media['media'])
-		elif msg.item_type == 'media':
-			m = msg.media
-			if m.media_type == 1:
-				url = m.thumbnail_url
-			elif m.media_type == 2:
-				url = m.video_url
-			else:
-				print(f'Unknown media type: {m.media_type}')
-				continue
-			ddl_thread_media(url)
+			new_comment = insta.get_comments(last_comment)
 
-	pass
-	# for thread in list_threads():
-	#     print(thread.id, thread.thread_title)
-	# data = cl.get_timeline_feed()
+			insta.cur.execute('UPDATE cache SET value=? WHERE key="last_seen_comment"', (new_comment,))
+			insta.con.commit()
+	except Exception as e:
+		insta.send_error(e)
+
+
+	exit()

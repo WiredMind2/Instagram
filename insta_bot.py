@@ -1,4 +1,3 @@
-import uuid
 from dateutil.parser import isoparse
 import os
 import pickle
@@ -7,7 +6,6 @@ from ssl import SSLError
 import threading
 import time
 from urllib.parse import urlparse
-from more_itertools import first
 
 from tkinter import *
 
